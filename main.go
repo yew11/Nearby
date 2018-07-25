@@ -65,7 +65,7 @@ func main() {
 	fmt.Println("Started-service")
 	http.HandleFunc("/search", handlerSearch)
 	http.HandleFunc("/post", handlerPost)
-	log.Fatal(http.ListenAndServe(":9090", nil))
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func handlerPost(w http.ResponseWriter, r *http.Request) {
