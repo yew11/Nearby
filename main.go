@@ -14,7 +14,7 @@ const(
 	DISTANCE = "200km"
 	INDEX = "around"
 	TYPE = "post"
-	ES_URL = "http://35.236.212.229:9200"
+	ES_URL = "http://35.199.31.117:9200"
 )
 
 type Location struct {
