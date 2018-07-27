@@ -1,20 +1,32 @@
 package main
 
-import ( "fmt"
+import (
+	"context"
 	"encoding/json"
-	elastic "gopkg.in/olivere/elastic.v3"
-	"net/http"
+	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"reflect"
 	"strconv"
-      "reflect"
-      "github.com/pborman/uuid"
+
+	"cloud.google.com/go/storage"
+	jwtmiddleware "github.com/auth0/go-jwt-middleware"
+	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
+
+	"github.com/pborman/uuid"
+	elastic "gopkg.in/olivere/elastic.v3"
 )
 
-const(
-	DISTANCE = "200km"
-	INDEX = "around"
-	TYPE = "post"
-	ES_URL = "http://35.199.31.117:9200"
+var mySigningKey = []byte("secret")
+
+const (
+	DISTANCE    = "200km"
+	INDEX       = "around"
+	TYPE        = "post"
+	ES_URL      = "http://35.199.31.117:9200"
+	BUCKET_NAME = "post-image-211300"
 )
 
 type Location struct {
@@ -23,14 +35,14 @@ type Location struct {
 }
 
 type Post struct {
-	User string `json: "user"`
-	Message string `json:"message"`
+	User     string   `json: "user"`
+	Message  string   `json:"message"`
 	Location Location `json: "location"`
+	Url      string   `json:"url"`
 }
 
-
 func main() {
-      	// Create a client
+	// Create a client
 	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 	if err != nil {
 		panic(err)
@@ -63,31 +75,109 @@ func main() {
 	}
 
 	fmt.Println("Started-service")
-	http.HandleFunc("/search", handlerSearch)
-	http.HandleFunc("/post", handlerPost)
+	r := mux.NewRouter()
+	var jwtMiddleware = jwtmiddleware.New(jwtmiddleware.Options{
+		ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+			return mySigningKey, nil
+		},
+		SigningMethod: jwt.SigningMethodHS256,
+	})
+
+	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+
+	http.Handle("/", r)
 	log.Fatal(http.ListenAndServe(":8080", nil))
+
 }
 
 func handlerPost(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Received one post request.")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
 
-	decoder := json.NewDecoder(r.Body)
-	var p Post
-	if err := decoder.Decode(&p); err != nil {
-		panic(err)
+	user := r.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
+
+	r.ParseMultipartForm(32 << 20)
+
+	//parse form data
+	fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+
+	p := &Post{
+		User:    username.(string),
+		Message: r.FormValue("message"),
+		Location: Location{
+			Lat: lat,
+			Lon: lon,
+		},
 	}
-      fmt.Fprintf(w, "Post received: %s\n", p.Message)
-      
-      id := uuid.New()
-      saveToES(&p, id)
+
+	id := uuid.New()
+
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "Image is not available", http.StatusInternalServerError)
+		fmt.Printf("Image is not available %v.\n", err)
+		return
+	}
+	defer file.Close()
+	ctx := context.Background()
+	_, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
+	if err != nil {
+		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+		fmt.Printf("GCS is not setup %v\n", err)
+		return
+	}
+	p.Url = attrs.MediaLink
+
+	saveToES(p, id)
+}
+
+func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer client.Close()
+
+	bucket := client.Bucket(bucketName)
+	// Next check if the bucket exists
+	if _, err = bucket.Attrs(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	obj := bucket.Object(name)
+	w := obj.NewWriter(ctx)
+	if _, err := io.Copy(w, r); err != nil {
+		return nil, nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, nil, err
+	}
+
+	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+		return nil, nil, err
+	}
+
+	attrs, err := obj.Attrs(ctx)
+	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
+	return obj, attrs, err
+
 }
 
 func saveToES(p *Post, id string) {
-      es_client, err := elastic.NewClient(elastic.SetURL(ES_URL), 
-            elastic.SetSniff(false))
-      if err != nil {
-            panic(err)
-      }
+	es_client, err := elastic.NewClient(elastic.SetURL(ES_URL),
+		elastic.SetSniff(false))
+	if err != nil {
+		panic(err)
+	}
 
 	_, err = es_client.Index().
 		Index(INDEX).
@@ -108,67 +198,64 @@ func saveToES(p *Post, id string) {
 func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Received one request for search")
 
-	lat,_ := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
-	lon,_ := strconv.ParseFloat(r.URL.Query().Get("lon"), 64)
+	lat, _ := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.URL.Query().Get("lon"), 64)
 
 	ran := DISTANCE
 	if val := r.URL.Query().Get("range"); val != "" {
 		ran = val + "km"
 	}
 
-     fmt.Printf( "Search received: %f %f %s\n", lat, lon, ran)
+	fmt.Printf("Search received: %f %f %s\n", lat, lon, ran)
 
-      // Create a client
-      client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
-      if err != nil {
-             panic(err)
-             return
-      }
+	// Create a client
+	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
+	if err != nil {
+		panic(err)
+		return
+	}
 
-      // Define geo distance query as specified in
-      // https://www.elastic.co/guide/en/elasticsearch/reference/5.2/query-dsl-geo-distance-query.html
-      q := elastic.NewGeoDistanceQuery("location")
-      q = q.Distance(ran).Lat(lat).Lon(lon)
+	// Define geo distance query as specified in
+	// https://www.elastic.co/guide/en/elasticsearch/reference/5.2/query-dsl-geo-distance-query.html
+	q := elastic.NewGeoDistanceQuery("location")
+	q = q.Distance(ran).Lat(lat).Lon(lon)
 
-      // Some delay may range from seconds to minutes. So if you don't get enough results. Try it later.
-      searchResult, err := client.Search().
-             Index(INDEX).
-             Query(q).
-             Pretty(true).
-             Do()
-      if err != nil {
-             // Handle error
-             panic(err)
-      }
+	// Some delay may range from seconds to minutes. So if you don't get enough results. Try it later.
+	searchResult, err := client.Search().
+		Index(INDEX).
+		Query(q).
+		Pretty(true).
+		Do()
+	if err != nil {
+		// Handle error
+		panic(err)
+	}
 
-      // searchResult is of type SearchResult and returns hits, suggestions,
-      // and all kinds of other information from Elasticsearch.
-      fmt.Printf("Query took %d milliseconds\n", searchResult.TookInMillis)
-      // TotalHits is another convenience function that works even when something goes wrong.
-      fmt.Printf("Found a total of %d post\n", searchResult.TotalHits())
+	// searchResult is of type SearchResult and returns hits, suggestions,
+	// and all kinds of other information from Elasticsearch.
+	fmt.Printf("Query took %d milliseconds\n", searchResult.TookInMillis)
+	// TotalHits is another convenience function that works even when something goes wrong.
+	fmt.Printf("Found a total of %d post\n", searchResult.TotalHits())
 
-      // Each is a convenience function that iterates over hits in a search result.
-      // It makes sure you don't need to check for nil values in the response.
-      // However, it ignores errors in serialization.
-      var typ Post
-      var ps []Post
-      for _, item := range searchResult.Each(reflect.TypeOf(typ)) { // instance of
-             p := item.(Post) // p = (Post) item
-             fmt.Printf("Post by %s: %s at lat %v and lon %v\n", p.User, p.Message, p.Location.Lat, p.Location.Lon)
-             // TODO(student homework): Perform filtering based on keywords such as web spam etc.
-             ps = append(ps, p)
+	// Each is a convenience function that iterates over hits in a search result.
+	// It makes sure you don't need to check for nil values in the response.
+	// However, it ignores errors in serialization.
+	var typ Post
+	var ps []Post
+	for _, item := range searchResult.Each(reflect.TypeOf(typ)) { // instance of
+		p := item.(Post) // p = (Post) item
+		fmt.Printf("Post by %s: %s at lat %v and lon %v\n", p.User, p.Message, p.Location.Lat, p.Location.Lon)
+		// TODO(student homework): Perform filtering based on keywords such as web spam etc.
+		ps = append(ps, p)
 
-      }
-      js, err := json.Marshal(ps)
-      if err != nil {
-             panic(err)
-             return
-      }
+	}
+	js, err := json.Marshal(ps)
+	if err != nil {
+		panic(err)
+		return
+	}
 
-      w.Header().Set("Content-Type", "application/json")
-      w.Header().Set("Access-Control-Allow-Origin", "*")
-      w.Write(js)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write(js)
 }
-
-
-
